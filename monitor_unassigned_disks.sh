@@ -1,38 +1,66 @@
 #!/bin/bash
-# Monitor Unraid Unassigned Devices mounts: presence + space (skip space while spun down).
-# Designed for the CA User Scripts plugin. Scheduling is configured in the plugin UI.
+#name=UD Disk Monitor
+#description=Monitor Unassigned Devices mounts for presence and free space; alert via Unraid notifications.
+#arrayStarted=true
 #
-# Env:
-#   UD_MONITOR_CONFIG  Path to config file (default: /boot/config/ud-disk-monitor.conf)
-#   UD_MONITOR_STATE   Override STATE_DIR from config
+# Repo / instructions:
+#   https://github.com/jorgenjanssonlee/unraid-unassigned-disks-monitor
 #
-# Usage:
-#   monitor_unassigned_disks.sh [--dry-run]
+# Paste into CA User Scripts. Edit the USER CONFIGURATION section below, then schedule in the UI.
+# Usage: monitor_unassigned_disks.sh [--dry-run]
+# Optional env: UD_MONITOR_STATE overrides STATE_DIR
 
 PATH=/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin
 set -euo pipefail
+
+######## USER CONFIGURATION - edit below ########
+# On upgrade: copy this whole block into the new script.
+
+# Global defaults
+# MODE: percent = alert when used% >= VALUE
+#       free_gb = alert when free GiB <= VALUE
+WARN_MODE=percent
+WARN_VALUE=80
+FAIL_MODE=percent
+FAIL_VALUE=90
+
+# Alert state directory (RAM on Unraid; cleared on reboot - intentional).
+# For persistence across reboots, use a path on the array/cache, e.g.:
+# STATE_DIR=/mnt/user/appdata/ud-disk-monitor
+STATE_DIR=/var/tmp/ud-disk-monitor
+
+# Unraid syslog (logger): issues = warn/fail/errors only; all = every script message
+# User Scripts stdout always logs every run and outcome either way.
+SYSLOG_MODE=issues
+
+# Disks to monitor (always-present local/USB mounts).
+# Format: "mount|warn_mode|warn_value|fail_mode|fail_value"
+# Leave override fields empty to inherit globals.
+DISKS=(
+  # "/mnt/disks/backup||||"
+  # "/mnt/disks/cameras|free_gb|100|free_gb|50"
+  # "/mnt/disks/scratch|percent|70|percent|85"
+)
+######## END USER CONFIGURATION #################
 
 NOTIFY=/usr/local/emhttp/webGui/scripts/notify
 LOG_TAG=ud-disk-monitor
 DRY_RUN=0
 
-WARN_MODE=percent
-WARN_VALUE=80
-FAIL_MODE=percent
-FAIL_VALUE=90
-STATE_DIR=/var/tmp/ud-disk-monitor
-
-# Disk lines: mount|warn_mode|warn_value|fail_mode|fail_value
-DISKS=()
-
+# Always print to stdout (User Scripts log). Syslog depends on SYSLOG_MODE / issue flag.
+# Usage: log "message"           - stdout; syslog only if SYSLOG_MODE=all
+#        log "message" issue     - stdout + syslog (warn/fail/errors)
 log() {
   local msg=$1
-  logger -t "$LOG_TAG" -- "$msg" 2>/dev/null || true
+  local kind=${2:-}
   echo "$msg"
+  if [[ "$kind" == "issue" || "$SYSLOG_MODE" == "all" ]]; then
+    logger -t "$LOG_TAG" -- "$msg" 2>/dev/null || true
+  fi
 }
 
 die() {
-  log "ERROR: $1"
+  log "ERROR: $1" issue
   exit 1
 }
 
@@ -52,63 +80,28 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-resolve_config() {
-  if [[ -n "${UD_MONITOR_CONFIG:-}" ]]; then
-    echo "$UD_MONITOR_CONFIG"
-    return
-  fi
-  local beside
-  beside="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config"
-  if [[ -f "$beside" ]]; then
-    echo "$beside"
-    return
-  fi
-  echo "/boot/config/ud-disk-monitor.conf"
+config_die() {
+  die "Config not OK: $1"
 }
 
-load_config() {
-  local cfg line key value
-  cfg=$(resolve_config)
-  [[ -f "$cfg" ]] || die "Config not found: $cfg (copy config.example and edit)"
-
-  DISKS=()
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%%#*}"
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    [[ -z "$line" ]] && continue
-
-    if [[ "$line" == *'='* && "$line" != /* && "$line" != *'|'* ]]; then
-      key="${line%%=*}"
-      value="${line#*=}"
-      key="${key%"${key##*[![:space:]]}"}"
-      value="${value#"${value%%[![:space:]]*}"}"
-      case "$key" in
-        WARN_MODE) WARN_MODE=$value ;;
-        WARN_VALUE) WARN_VALUE=$value ;;
-        FAIL_MODE) FAIL_MODE=$value ;;
-        FAIL_VALUE) FAIL_VALUE=$value ;;
-        STATE_DIR) STATE_DIR=$value ;;
-        *) log "Ignoring unknown config key: $key" ;;
-      esac
-      continue
-    fi
-
-    if [[ "$line" == /* ]]; then
-      DISKS+=("$line")
-      continue
-    fi
-
-    log "Ignoring unrecognized config line: $line"
-  done <"$cfg"
-
+validate_config() {
   if [[ -n "${UD_MONITOR_STATE:-}" ]]; then
     STATE_DIR=$UD_MONITOR_STATE
   fi
 
-  [[ ${#DISKS[@]} -gt 0 ]] || die "No disks configured in $cfg"
-  mkdir -p "$STATE_DIR"
-  log "Loaded config $cfg (${#DISKS[@]} disk(s)), state=$STATE_DIR"
+  validate_mode "$WARN_MODE" || config_die "Invalid WARN_MODE: $WARN_MODE"
+  validate_mode "$FAIL_MODE" || config_die "Invalid FAIL_MODE: $FAIL_MODE"
+  [[ "$WARN_VALUE" =~ ^[0-9]+$ ]] || config_die "Invalid WARN_VALUE: $WARN_VALUE"
+  [[ "$FAIL_VALUE" =~ ^[0-9]+$ ]] || config_die "Invalid FAIL_VALUE: $FAIL_VALUE"
+
+  case "$SYSLOG_MODE" in
+    issues|all) ;;
+    *) config_die "Invalid SYSLOG_MODE: $SYSLOG_MODE (use issues or all)" ;;
+  esac
+
+  [[ ${#DISKS[@]} -gt 0 ]] || config_die "No disks configured - edit the USER CONFIGURATION section (DISKS array)"
+  mkdir -p "$STATE_DIR" || config_die "Cannot create STATE_DIR: $STATE_DIR"
+  log "Config OK (${#DISKS[@]} disk(s)), state=$STATE_DIR, syslog=$SYSLOG_MODE"
 }
 
 validate_mode() {
@@ -147,7 +140,7 @@ send_notify() {
     return
   fi
   if [[ ! -x "$NOTIFY" ]]; then
-    log "notify helper missing ($NOTIFY); subject=$subject desc=$description"
+    log "notify helper missing ($NOTIFY); subject=$subject desc=$description" issue
     return
   fi
   "$NOTIFY" -e "UD Disk Monitor" -s "$subject" -d "$description" -i "$importance"
@@ -210,7 +203,7 @@ whole_disk() {
 }
 
 # Returns 0 if disk is spun down / sleeping (skip space check).
-# Returns 1 if awake/unknown (proceed with space check — unknown errs toward checking).
+# Returns 1 if awake/unknown (proceed with space check - unknown errs toward checking).
 disk_is_asleep() {
   local disk=$1 out
   [[ -b "$disk" ]] || return 1
@@ -229,7 +222,7 @@ disk_is_asleep() {
 read_space() {
   local mount=$1
   local total used avail
-  # df can wake a spun-down disk — caller must gate on power state.
+  # df can wake a spun-down disk - caller must gate on power state.
   read -r total used avail < <(df -P -B1 "$mount" 2>/dev/null | awk 'NR==2 {print $2, $3, $4}')
   [[ -n "${total:-}" && "$total" -gt 0 ]] || return 1
   TOTAL_BYTES=$total
@@ -265,20 +258,20 @@ effective_fields() {
   EFF_FAIL_MODE=${fm:-$FAIL_MODE}
   EFF_FAIL_VALUE=${fv:-$FAIL_VALUE}
 
-  validate_mode "$EFF_WARN_MODE" || die "Invalid warn mode for $m: $EFF_WARN_MODE"
-  validate_mode "$EFF_FAIL_MODE" || die "Invalid fail mode for $m: $EFF_FAIL_MODE"
-  [[ "$EFF_WARN_VALUE" =~ ^[0-9]+$ ]] || die "Invalid warn value for $m: $EFF_WARN_VALUE"
-  [[ "$EFF_FAIL_VALUE" =~ ^[0-9]+$ ]] || die "Invalid fail value for $m: $EFF_FAIL_VALUE"
+  validate_mode "$EFF_WARN_MODE" || config_die "Invalid warn mode for $m: $EFF_WARN_MODE"
+  validate_mode "$EFF_FAIL_MODE" || config_die "Invalid fail mode for $m: $EFF_FAIL_MODE"
+  [[ "$EFF_WARN_VALUE" =~ ^[0-9]+$ ]] || config_die "Invalid warn value for $m: $EFF_WARN_VALUE"
+  [[ "$EFF_FAIL_VALUE" =~ ^[0-9]+$ ]] || config_die "Invalid fail value for $m: $EFF_FAIL_VALUE"
 }
 
 check_disk() {
   local line=$1
-  local block disk space_state desc
+  local block disk desc
 
   effective_fields "$line"
 
   if ! is_mounted "$EFF_MOUNT"; then
-    log "$EFF_MOUNT: not mounted"
+    log "$EFF_MOUNT: not mounted" issue
     transition "presence" "$EFF_MOUNT" "missing" "alert" \
       "UD disk not mounted" \
       "$EFF_MOUNT is not mounted"
@@ -287,7 +280,7 @@ check_disk() {
 
   block=$(resolve_block_device "$EFF_MOUNT" || true)
   if [[ -z "$block" || ! -b "$block" ]]; then
-    log "$EFF_MOUNT: mounted but block device missing"
+    log "$EFF_MOUNT: mounted but block device missing" issue
     transition "presence" "$EFF_MOUNT" "nodevice" "alert" \
       "UD disk device missing" \
       "$EFF_MOUNT is mounted but its block device is gone"
@@ -300,24 +293,22 @@ check_disk() {
 
   disk=$(whole_disk "$block")
   if disk_is_asleep "$disk"; then
-    log "$EFF_MOUNT: $disk asleep — skipping space check"
+    log "$EFF_MOUNT: $disk asleep - skipping space check"
     return
   fi
 
   if ! read_space "$EFF_MOUNT"; then
-    log "$EFF_MOUNT: failed to read free space"
+    log "$EFF_MOUNT: failed to read free space" issue
     transition "space" "$EFF_MOUNT" "fail" "alert" \
       "UD disk space check failed" \
       "Could not read free space for $EFF_MOUNT"
     return
   fi
 
-  space_state=ok
   desc="$EFF_MOUNT: ${USED_PCT}% used, ${FREE_GIB} GiB free (device $block)"
 
   if threshold_breached "$EFF_FAIL_MODE" "$EFF_FAIL_VALUE"; then
-    space_state=fail
-    log "$desc — FAIL ($EFF_FAIL_MODE=$EFF_FAIL_VALUE)"
+    log "$desc - FAIL ($EFF_FAIL_MODE=$EFF_FAIL_VALUE)" issue
     transition "space" "$EFF_MOUNT" "fail" "alert" \
       "UD disk space critical" \
       "$desc (fail threshold $EFF_FAIL_MODE=$EFF_FAIL_VALUE)"
@@ -325,22 +316,21 @@ check_disk() {
   fi
 
   if threshold_breached "$EFF_WARN_MODE" "$EFF_WARN_VALUE"; then
-    space_state=warn
-    log "$desc — WARN ($EFF_WARN_MODE=$EFF_WARN_VALUE)"
+    log "$desc - WARN ($EFF_WARN_MODE=$EFF_WARN_VALUE)" issue
     transition "space" "$EFF_MOUNT" "warn" "warning" \
       "UD disk space warning" \
       "$desc (warn threshold $EFF_WARN_MODE=$EFF_WARN_VALUE)"
     return
   fi
 
-  log "$desc — OK"
+  log "$desc - OK"
   transition "space" "$EFF_MOUNT" "ok" "normal" \
     "UD disk space recovered" \
     "$desc"
 }
 
 main() {
-  load_config
+  validate_config
   local line
   for line in "${DISKS[@]}"; do
     check_disk "$line"
