@@ -72,8 +72,10 @@ Usage: monitor_unassigned_disks.sh [--dry-run]
 EOF
 }
 
+# User Scripts often invokes as: bash script ''  (empty arg) when Run is clicked.
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    "") shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
