@@ -29,7 +29,8 @@ FAIL_VALUE=90
 # STATE_DIR=/mnt/user/appdata/ud-disk-monitor
 STATE_DIR=/var/tmp/ud-disk-monitor
 
-# Unraid syslog (logger): issues = warn/fail/errors only; all = every script message
+# Unraid syslog (logger): issues = only on notify transitions + fatal errors;
+#                         all = every script message
 # User Scripts stdout always logs every run and outcome either way.
 SYSLOG_MODE=issues
 
@@ -47,20 +48,24 @@ NOTIFY=/usr/local/emhttp/webGui/scripts/notify
 LOG_TAG=ud-disk-monitor
 DRY_RUN=0
 
-# Always print to stdout (User Scripts log). Syslog depends on SYSLOG_MODE / issue flag.
-# Usage: log "message"           - stdout; syslog only if SYSLOG_MODE=all
-#        log "message" issue     - stdout + syslog (warn/fail/errors)
+# Always print to stdout (User Scripts log).
+# Syslog: SYSLOG_MODE=all → every log line; issues → only via syslog_issue / send_notify.
 log() {
   local msg=$1
-  local kind=${2:-}
   echo "$msg"
-  if [[ "$kind" == "issue" || "$SYSLOG_MODE" == "all" ]]; then
+  if [[ "$SYSLOG_MODE" == "all" ]]; then
     logger -t "$LOG_TAG" -- "$msg" 2>/dev/null || true
   fi
 }
 
+syslog_issue() {
+  logger -t "$LOG_TAG" -- "$1" 2>/dev/null || true
+}
+
 die() {
-  log "ERROR: $1" issue
+  local msg="ERROR: $1"
+  echo "$msg"
+  syslog_issue "$msg"
   exit 1
 }
 
@@ -137,15 +142,23 @@ set_state() {
 
 send_notify() {
   local importance=$1 subject=$2 description=$3
+  local summary="[$importance] $subject - $description"
+
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN notify -i $importance -s \"$subject\" -d \"$description\""
+    log "DRY-RUN notify $summary"
+  elif [[ ! -x "$NOTIFY" ]]; then
+    log "notify helper missing ($NOTIFY); $summary"
+    syslog_issue "notify helper missing ($NOTIFY); $summary"
     return
+  else
+    "$NOTIFY" -e "UD Disk Monitor" -s "$subject" -d "$description" -i "$importance"
+    log "Notified: $summary"
   fi
-  if [[ ! -x "$NOTIFY" ]]; then
-    log "notify helper missing ($NOTIFY); subject=$subject desc=$description" issue
-    return
+
+  # issues mode: syslog only when a notification actually fires (transitions)
+  if [[ "$SYSLOG_MODE" == "issues" ]]; then
+    syslog_issue "$summary"
   fi
-  "$NOTIFY" -e "UD Disk Monitor" -s "$subject" -d "$description" -i "$importance"
 }
 
 # On transition: alert when leaving ok/empty for a bad state; recover when returning to ok.
@@ -204,11 +217,23 @@ whole_disk() {
   fi
 }
 
+# True if block device is on a USB bus (sysfs path contains /usb).
+is_usb_disk() {
+  local disk=$1 name link
+  name=$(basename "$disk")
+  link=$(readlink -f "/sys/block/$name" 2>/dev/null) || return 1
+  [[ "$link" == *"/usb"* ]]
+}
+
 # Returns 0 if disk is spun down / sleeping (skip space check).
-# Returns 1 if awake/unknown (proceed with space check - unknown errs toward checking).
+# Returns 1 if awake/unknown/USB (proceed with space check).
+# USB: hdparm -C is often wrong (stuck on "standby") even after I/O - never skip.
 disk_is_asleep() {
   local disk=$1 out
   [[ -b "$disk" ]] || return 1
+  if is_usb_disk "$disk"; then
+    return 1
+  fi
   if ! command -v hdparm >/dev/null 2>&1; then
     return 1
   fi
@@ -266,14 +291,43 @@ effective_fields() {
   [[ "$EFF_FAIL_VALUE" =~ ^[0-9]+$ ]] || config_die "Invalid fail value for $m: $EFF_FAIL_VALUE"
 }
 
+# After a mount comes back: one notification that includes current space status if bad.
+notify_mount_recovered() {
+  local mount=$1 block=$2 space_state=$3 space_desc=$4
+  local importance=normal subject="UD disk mount recovered" description
+
+  case "$space_state" in
+    fail)
+      importance=alert
+      subject="UD disk mount recovered (space critical)"
+      description="$mount is mounted again ($block) but space is still critical: $space_desc"
+      ;;
+    warn)
+      importance=warning
+      subject="UD disk mount recovered (space warning)"
+      description="$mount is mounted again ($block) but space is still in warning: $space_desc"
+      ;;
+    skipped)
+      description="$mount is mounted again ($block). Space check skipped (disk asleep)."
+      ;;
+    *)
+      description="$mount is mounted again ($block). Space OK: $space_desc"
+      ;;
+  esac
+
+  send_notify "$importance" "$subject" "$description"
+}
+
 check_disk() {
   local line=$1
   local block disk desc
+  local presence_prev presence_recovered=0
+  local space_state
 
   effective_fields "$line"
 
   if ! is_mounted "$EFF_MOUNT"; then
-    log "$EFF_MOUNT: not mounted" issue
+    log "$EFF_MOUNT: not mounted"
     transition "presence" "$EFF_MOUNT" "missing" "alert" \
       "UD disk not mounted" \
       "$EFF_MOUNT is not mounted"
@@ -282,53 +336,82 @@ check_disk() {
 
   block=$(resolve_block_device "$EFF_MOUNT" || true)
   if [[ -z "$block" || ! -b "$block" ]]; then
-    log "$EFF_MOUNT: mounted but block device missing" issue
+    log "$EFF_MOUNT: mounted but block device missing"
     transition "presence" "$EFF_MOUNT" "nodevice" "alert" \
       "UD disk device missing" \
       "$EFF_MOUNT is mounted but its block device is gone"
     return
   fi
 
-  transition "presence" "$EFF_MOUNT" "ok" "normal" \
-    "UD disk mount recovered" \
-    "$EFF_MOUNT is mounted again ($block)"
+  presence_prev=$(get_state "presence" "$EFF_MOUNT")
+  if [[ -n "$presence_prev" && "$presence_prev" != "ok" ]]; then
+    presence_recovered=1
+  fi
+  set_state "presence" "$EFF_MOUNT" "ok"
 
   disk=$(whole_disk "$block")
   if disk_is_asleep "$disk"; then
     log "$EFF_MOUNT: $disk asleep - skipping space check"
+    if [[ "$presence_recovered" -eq 1 ]]; then
+      notify_mount_recovered "$EFF_MOUNT" "$block" "skipped" ""
+    fi
     return
   fi
 
   if ! read_space "$EFF_MOUNT"; then
-    log "$EFF_MOUNT: failed to read free space" issue
-    transition "space" "$EFF_MOUNT" "fail" "alert" \
-      "UD disk space check failed" \
-      "Could not read free space for $EFF_MOUNT"
+    log "$EFF_MOUNT: failed to read free space"
+    if [[ "$presence_recovered" -eq 1 ]]; then
+      notify_mount_recovered "$EFF_MOUNT" "$block" "fail" "Could not read free space"
+      set_state "space" "$EFF_MOUNT" "fail"
+    else
+      transition "space" "$EFF_MOUNT" "fail" "alert" \
+        "UD disk space check failed" \
+        "Could not read free space for $EFF_MOUNT"
+    fi
     return
   fi
 
   desc="$EFF_MOUNT: ${USED_PCT}% used, ${FREE_GIB} GiB free (device $block)"
 
   if threshold_breached "$EFF_FAIL_MODE" "$EFF_FAIL_VALUE"; then
-    log "$desc - FAIL ($EFF_FAIL_MODE=$EFF_FAIL_VALUE)" issue
-    transition "space" "$EFF_MOUNT" "fail" "alert" \
-      "UD disk space critical" \
-      "$desc (fail threshold $EFF_FAIL_MODE=$EFF_FAIL_VALUE)"
+    space_state=fail
+    log "$desc - FAIL ($EFF_FAIL_MODE=$EFF_FAIL_VALUE)"
+    if [[ "$presence_recovered" -eq 1 ]]; then
+      notify_mount_recovered "$EFF_MOUNT" "$block" "fail" \
+        "$desc (fail threshold $EFF_FAIL_MODE=$EFF_FAIL_VALUE)"
+      set_state "space" "$EFF_MOUNT" "fail"
+    else
+      transition "space" "$EFF_MOUNT" "fail" "alert" \
+        "UD disk space critical" \
+        "$desc (fail threshold $EFF_FAIL_MODE=$EFF_FAIL_VALUE)"
+    fi
     return
   fi
 
   if threshold_breached "$EFF_WARN_MODE" "$EFF_WARN_VALUE"; then
-    log "$desc - WARN ($EFF_WARN_MODE=$EFF_WARN_VALUE)" issue
-    transition "space" "$EFF_MOUNT" "warn" "warning" \
-      "UD disk space warning" \
-      "$desc (warn threshold $EFF_WARN_MODE=$EFF_WARN_VALUE)"
+    space_state=warn
+    log "$desc - WARN ($EFF_WARN_MODE=$EFF_WARN_VALUE)"
+    if [[ "$presence_recovered" -eq 1 ]]; then
+      notify_mount_recovered "$EFF_MOUNT" "$block" "warn" \
+        "$desc (warn threshold $EFF_WARN_MODE=$EFF_WARN_VALUE)"
+      set_state "space" "$EFF_MOUNT" "warn"
+    else
+      transition "space" "$EFF_MOUNT" "warn" "warning" \
+        "UD disk space warning" \
+        "$desc (warn threshold $EFF_WARN_MODE=$EFF_WARN_VALUE)"
+    fi
     return
   fi
 
   log "$desc - OK"
-  transition "space" "$EFF_MOUNT" "ok" "normal" \
-    "UD disk space recovered" \
-    "$desc"
+  if [[ "$presence_recovered" -eq 1 ]]; then
+    notify_mount_recovered "$EFF_MOUNT" "$block" "ok" "$desc"
+    set_state "space" "$EFF_MOUNT" "ok"
+  else
+    transition "space" "$EFF_MOUNT" "ok" "normal" \
+      "UD disk space recovered" \
+      "$desc"
+  fi
 }
 
 main() {

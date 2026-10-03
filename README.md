@@ -2,19 +2,21 @@
 
 A **User Scripts** helper that monitors **Unassigned Devices** mounts for free space and presence. Unraid's built-in disk alerts do not cover these mounts.
 
-It periodically checks that a configured mount is present and (when the disk is awake) that free space is within warn/fail thresholds, then alerts through Unraid's built-in notification system.
+It periodically checks that a configured mount is present and that free space is within warn/fail thresholds, then alerts through Unraid's built-in notification system.
 
 License: [MIT-0](LICENSE) (use freely; no attribution required).
 
 ## What it checks
 
 
-| Check         | Behavior                                                                                                                                     |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Presence**  | Mount path is an active mount **and** its block device node still exists                                                                     |
-| **Space**     | Used % or free GiB vs warn/fail thresholds                                                                                                   |
-| **Spin-down** | If the disk is in standby/sleep (`hdparm -C`), **space is skipped** so the check does not wake it. Presence is still checked (no media I/O). |
+| Check | Behavior |
+| --- | --- |
+| **Presence** | Mount path is an active mount **and** its block device node still exists |
+| **Space** | Used % or free GiB vs warn/fail thresholds |
+| **Spin-down (non-USB)** | If the disk is in standby/sleep (`hdparm -C`), **space is skipped** so the check does not wake it |
+| **USB** | Space is **always** checked. `hdparm -C` is unreliable on many sticks (often stuck on "standby"), so spin-down skipping is not used |
 
+**USB note:** every scheduled run issues filesystem I/O (`df`) against monitored USB mounts. That can keep a USB disk from staying idle. Prefer a longer cron interval if that matters. Presence checks alone do not require this I/O.
 
 Out of scope: SMART, temperature, remote SMB/NFS Unassigned Devices shares, scheduling inside the script.
 
@@ -52,7 +54,7 @@ WARN_VALUE=80
 FAIL_MODE=percent
 FAIL_VALUE=90
 STATE_DIR=/var/tmp/ud-disk-monitor
-SYSLOG_MODE=issues   # issues = warn/fail/errors only; all = every message
+SYSLOG_MODE=issues   # issues = notify transitions + fatal errors; all = every message
 
 DISKS=(
   "/mnt/disks/backup||||"
@@ -74,6 +76,8 @@ Fail supersedes warn when both would match.
 
 Only monitor disks that should **always** be present (local or always-plugged USB). Removable media you intentionally unplug will alert as missing.
 
+Remember: USB mounts get a space check on **every** run (see [What it checks](#what-it-checks)).
+
 ## Alerts and state
 
 - Uses `/usr/local/emhttp/webGui/scripts/notify` with importance `warning` / `alert`, and `normal` on recovery.
@@ -81,14 +85,16 @@ Only monitor disks that should **always** be present (local or always-plugged US
 - On Unraid this path is **RAM-backed and cleared on reboot**. That is intentional:
   - During uptime: notify only on **transitions** (no spam every cron tick).
   - After reboot: if a disk is still bad, you get **one new alert**; if healthy, no recovery notice.
+- When a mount comes back after missing, the recovery notification **includes current space warn/fail** if still over threshold (one combined notice, severity matches space).
 - To keep state across reboots (usually unnecessary), point `STATE_DIR` at a persistent path.
 
 **Logging**
 
 - **User Scripts log** (stdout): every run - config summary, per-disk OK/skip/warn/fail, run complete.
 - **Unraid syslog** (`logger -t ud-disk-monitor`): controlled by `SYSLOG_MODE`
-  - `issues` (default) - warn/fail/missing, config not OK, and other errors
+  - `issues` (default) - only when a notification fires (state transitions) and fatal config/script errors
   - `all` - same messages as the script log
+- Lines like `emhttpd: cmd: .../user.scripts/startScript.sh ...` come from Unraid/User Scripts when a run is started (especially via **Run Script** in the UI). They are not from this monitor and are not controlled by `SYSLOG_MODE`.
 
 
 
@@ -97,7 +103,8 @@ Only monitor disks that should **always** be present (local or always-plugged US
 - **Add/remove a disk or tune thresholds:** edit the USER CONFIGURATION section in User Scripts. Changes apply on the next run.
 - **Upgrade the script:** paste the new script, then copy your USER CONFIGURATION block back in.
 - **Clear sticky alert state without reboot:** delete `/var/tmp/ud-disk-monitor` (file manager or terminal).
-- **Cold disks:** presence is still monitored; low-space alerts wait until the disk wakes for real work.
+- **Cold non-USB disks:** presence is still monitored; low-space alerts wait until the disk wakes for real work.
+- **USB disks:** space is checked every run (I/O on each schedule tick).
 
 ## Check logic
 
@@ -109,9 +116,11 @@ flowchart TD
   mounted -->|no| alertMissing[Alert: not mounted]
   mounted -->|yes| device{Device node exists?}
   device -->|no| alertDevice[Alert: device missing]
-  device -->|yes| power{Disk awake?}
+  device -->|yes| usb{USB device?}
+  usb -->|yes| space[df space check]
+  usb -->|no| power{Disk awake?}
   power -->|asleep| skipSpace[Skip space check]
-  power -->|awake| space[df space check]
+  power -->|awake| space
   space --> thresh{Warn or fail?}
   thresh -->|fail| alertFail[Notify alert]
   thresh -->|warn| alertWarn[Notify warning]
