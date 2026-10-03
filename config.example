@@ -1,0 +1,22 @@
+# Unraid Unassigned Devices disk monitor config
+# Copy to /boot/config/ud-disk-monitor.conf (or set UD_MONITOR_CONFIG).
+
+# Global defaults
+# MODE: percent = alert when used% >= VALUE
+#       free_gb = alert when free GiB <= VALUE
+WARN_MODE=percent
+WARN_VALUE=80
+FAIL_MODE=percent
+FAIL_VALUE=90
+
+# Alert state directory (RAM on Unraid; cleared on reboot — intentional)
+# STATE_DIR=/var/tmp/ud-disk-monitor
+
+# Disks to monitor (always-present local/USB mounts).
+# Format: mount|warn_mode|warn_value|fail_mode|fail_value
+# Leave override fields empty to inherit globals.
+#
+# Examples:
+# /mnt/disks/backup||||
+# /mnt/disks/cameras|free_gb|100|free_gb|50
+# /mnt/disks/scratch|percent|70|percent|85
