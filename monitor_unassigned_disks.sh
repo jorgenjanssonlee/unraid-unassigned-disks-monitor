@@ -245,15 +245,13 @@ disk_is_asleep() {
   return 1
 }
 
-# Sets globals: USED_PCT FREE_GIB TOTAL_BYTES FREE_BYTES
+# Sets globals: USED_PCT FREE_GIB
 read_space() {
   local mount=$1
   local total used avail
   # df can wake a spun-down disk - caller must gate on power state.
   read -r total used avail < <(df -P -B1 "$mount" 2>/dev/null | awk 'NR==2 {print $2, $3, $4}')
   [[ -n "${total:-}" && "$total" -gt 0 ]] || return 1
-  TOTAL_BYTES=$total
-  FREE_BYTES=$avail
   USED_PCT=$(( used * 100 / total ))
   # GiB with integer math (1024^3)
   FREE_GIB=$(( avail / 1024 / 1024 / 1024 ))
